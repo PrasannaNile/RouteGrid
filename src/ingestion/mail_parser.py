@@ -1,44 +1,69 @@
+"""Turn raw MIME messages into normalized mail records."""
+
+from __future__ import annotations
+
 import email
+from email import policy
 from email.header import decode_header
+from typing import Any
 
 
-def clean_header_text(header_val: str) -> str:
-    """Decodes MIME-encoded headers into a clean string."""
-    if not header_val:
+def clean_header_text(value: str | None) -> str:
+    """Decode RFC 2047 MIME-encoded headers into plain text."""
+
+    if not value:
         return ""
-    decoded_fragments = decode_header(header_val)
-    parsed_parts = []
-    for content, encoding in decoded_fragments:
+
+    parts = []
+
+    for content, encoding in decode_header(value):
         if isinstance(content, bytes):
-            parsed_parts.append(content.decode(encoding or "utf-8", errors="replace"))
+            try:
+                text = content.decode(
+                    encoding or "utf-8",
+                    errors="replace"
+                )
+            except (LookupError, UnicodeError):
+                text = content.decode("utf-8", errors="replace")
+            parts.append(text)
         else:
-            parsed_parts.append(str(content))
-    return "".join(parsed_parts)
+            parts.append(str(content))
+
+    return "".join(parts)
 
 
-def get_email_body(msg_obj) -> str:
-    """Extracts plaintext body from multipart or single-part messages."""
-    if msg_obj.is_multipart():
-        for part in msg_obj.walk():
-            content_type = part.get_content_type()
-            disposition = str(part.get("Content-Disposition"))
+def get_email_body(msg: email.message.Message) -> str:
+    """Return the first non-attachment ``text/plain`` part."""
 
-            if content_type == "text/plain" and "attachment" not in disposition:
-                payload = part.get_payload(decode=True)
-                charset = part.get_content_charset() or "utf-8"
-                return payload.decode(charset, errors="replace")
-    else:
-        payload = msg_obj.get_payload(decode=True)
-        charset = msg_obj.get_content_charset() or "utf-8"
-        return payload.decode(charset, errors="replace")
+    for part in msg.walk():
+        if part.get_content_type() != "text/plain":
+            continue
+
+        if part.get_content_disposition() == "attachment":
+            continue
+
+        payload = part.get_payload(decode=True)
+
+        if payload is None:
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+
+        try:
+            return payload.decode(charset, errors="replace")
+        except (LookupError, UnicodeError):
+            return payload.decode("utf-8", errors="replace")
 
     return "[No plain text content available]"
 
 
-def parse_raw_email(raw_bytes: bytes) -> dict:
-    """Converts raw email bytes into a clean dictionary."""
-    msg = email.message_from_bytes(raw_bytes)
+def parse_raw_email(raw_bytes: bytes, uid: Any) -> dict[str, Any]:
+    """Build the normalized record used by the router and the queues."""
+
+    msg = email.message_from_bytes(raw_bytes, policy=policy.default)
+
     return {
+        "id": str(uid),
         "subject": clean_header_text(msg.get("Subject")),
         "from": clean_header_text(msg.get("From")),
         "date": clean_header_text(msg.get("Date")),

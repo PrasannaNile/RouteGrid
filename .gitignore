@@ -45,3 +45,7 @@ dist/
 data/sample_emails/*.eml
 !data/sample_emails/.gitkeep
 *.log
+
+# Routing queues (contain real mail)
+queues/*
+!queues/.gitkeep
