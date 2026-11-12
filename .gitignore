@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+PITCH.md
+AGENTS.md
 
 # C extensions (if compiling C/C++ extensions later)
 *.so

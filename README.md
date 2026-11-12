@@ -1,144 +1,141 @@
-<p align="center">
-  <img src="https://i.postimg.cc/wv5nsJ0h/Route-Grid.png" alt="RouteGrid logo" width="360">
-</p>
+# RouteGrid
 
-<h1 align="center">RouteGrid</h1>
+**Prototype email triage for ZEISS India.** RouteGrid is the routing layer for a proposed unified customer email channel: customers write to one address, `contact@zeiss.com`, and RouteGrid decides which department queue should own each message. It watches an IMAP inbox, asks an OpenRouter Decisions model three typed questions, and appends the message to a local JSONL queue for downstream processing. It does not send replies, forward mail, or change anything in the mailbox.
 
-<p align="center">
-  <strong>Reflexive email triage for ZEISS India</strong><br>
-  Watches an inbox, understands each message, and files it in the right department queue in a single API call.
-</p>
+> **Status:** prototype. Output is local JSONL under `queues/`. There is no database, ticketing integration, or downstream consumer in this repository. For the rationale and the broader understand please provided Document.
 
-<p align="center">
-  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
-  <img alt="OpenRouter Decisions" src="https://img.shields.io/badge/OpenRouter-Decisions-6467f2">
-  <img alt="IMAP IDLE" src="https://img.shields.io/badge/IMAP-IDLE-0b7285">
-</p>
+## What it does
 
----
+- Watches the configured IMAP mailbox — the proposed unified inbox, `contact@zeiss.com` — over SSL using `IDLE`.
+- Skips the existing backlog and processes only mail that arrives after startup.
+- Normalizes each message to `{id, from, subject, date, body}`.
+- Sends one Decisions API request containing three typed questions.
+- Appends the message and the resulting decision to the matching department queue, `queues/<queue>/<UTC-date>.jsonl`, for downstream processing.
+- Sends non-inquiries, low-confidence results, unknown queue names, and failed classifications to `queues/_review/`.
 
-RouteGrid is the **System 1** layer of an email support pipeline: the fast, reflexive gatekeeper that reads incoming mail and dispatches it to the correct ZEISS India department queue. It is not a chatbot and it does not generate replies. It makes one narrow, typed decision per message and gets out of the way.
+The pipeline is deliberately one-way: no auto-replies, no forwarding, no moves, and no `\Seen` flags.
 
-- **Listens continuously** — connects over IMAP IDLE and reacts the moment mail arrives.
-- **Understands intent** — asks a decision model whether the mail is a real inquiry, which queue owns it, and how urgent it is.
-- **Never guesses silently** — low-confidence, non-inquiry, or failed classifications go to a human review queue with the reason attached.
-- **Leaves the mailbox alone** — read-only access, no flags, no moves, no deletes.
+## Unified email channel
 
-> **Status:** prototype. Routing output is local JSONL; RouteGrid does not send or forward email.
+Today ZEISS India publishes a separate address for each department:
 
----
+| Public address | Purpose / department |
+|---|---|
+| info.in@zeiss.com | General ZEISS India inquiries, company information, and customer assistance |
+| mikroservice.india@zeiss.com | Microscopy technical support, equipment servicing, repairs, and maintenance |
+| info.microscopy.in@zeiss.com | Microscopy product inquiries, sales information, and application assistance |
+| info.meditec.in@zeiss.com | Medical technology inquiries, including ophthalmology and surgical equipment |
+| iolorder.in@zeiss.com | Intraocular lens (IOL) orders, medical consumables, and related order inquiries |
+| info.metrology.in@zeiss.com | Industrial metrology, measuring equipment, quality inspection, and related support |
+| info@zeiss.co.in | General inquiries associated with ZEISS India's optical products and services |
+| dpo.in@zeiss.com | Data privacy concerns, personal data requests, and GDPR/Indian privacy compliance |
+| legal.in@zeiss.com | Legal inquiries, compliance matters, and privacy-related legal concerns |
+| webmaster@zeiss.com | Website technical problems, broken links, and other website-related issues |
 
-## Contents
+This puts the burden of knowing the org chart on the customer. A message sent to the wrong address is forwarded manually, delayed, or lost, and each inbox becomes a separate silo with no shared view of demand.
 
-- [How it works](#how-it-works)
-- [Queues](#queues)
-- [Project layout](#project-layout)
-- [Quick start](#quick-start)
-- [Configuration](#configuration)
-- [Classify a single message](#classify-a-single-message)
-- [Queue output](#queue-output)
-- [Routing policy](#routing-policy)
-- [Operational notes](#operational-notes)
-- [Security](#security)
-- [Development](#development)
+The target model is one public address, **`contact@zeiss.com`**, backed by RouteGrid:
 
----
+1. The customer sends to `contact@zeiss.com`.
+2. RouteGrid watches that mailbox and classifies each message.
+3. The message is written to the matching department queue, or to `_review` when the policy is not confident.
+4. A downstream service consumes the queue and performs the department-specific action: ticketing, assignment, reply, or delivery.
 
-## How it works
+The existing department addresses remain useful as internal routing targets and can stay as aliases during the transition. The public interface becomes one address; the internal taxonomy stays intact.
+
+> **Scope note:** the current prototype does not forward mail to the department addresses or send replies. It writes local JSONL queue records. Email delivery, alias management, and downstream processing are production integrations that sit outside this repository.
+
+## Pipeline
 
 ```text
-┌──────────────┐   IMAP IDLE   ┌───────────────┐   asyncio.Queue   ┌────────────────┐
-│  Mail server │ ────────────▶ │ ImapListener  │ ────────────────▶ │ email_consumer │
-└──────────────┘    new mail   └───────────────┘                   └───────┬────────┘
-                                                                          │ route_email()
-                                                                          ▼
-                                                          ┌───────────────────────────┐
-                                                          │  Decisions API            │
-                                                          │  ├ is_zeiss_inquiry       │
-                                                          │  ├ department             │
-                                                          │  └ urgency                │
-                                                          └─────────────┬─────────────┘
-                                                                        │
-                                             ┌──────────────────────────┴───────────────────────┐
-                                             ▼                                                  ▼
-                               queues/<department>/<date>.jsonl                  queues/_review/<date>.jsonl
+┌──────────────┐   IMAP IDLE   ┌────────────────┐   asyncio.Queue   ┌────────────────┐
+│  Mail server │ ────────────▶ │  ImapListener  │ ────────────────▶ │ email_consumer │
+└──────────────┘    new mail   │    (thread)    │                   └───────┬────────┘
+                               └────────────────┘                           │ route_email()
+                                                                            ▼
+                                                              ┌──────────────────────────┐
+                                                              │  Decisions API           │
+                                                              │  ├ is_zeiss_inquiry      │
+                                                              │  ├ department            │
+                                                              │  └ urgency               │
+                                                              └────────────┬─────────────┘
+                                                                           │
+                                                ┌──────────────────────────┴───────────────────────┐
+                                                ▼                                                  ▼
+                                  queues/<department>/<date>.jsonl                  queues/_review/<date>.jsonl
 ```
 
-1. **Ingest** — `ImapListener` logs in, selects the folder read-only, records the highest existing UID (so the old backlog is skipped), and waits on `IDLE`.
-2. **Normalize** — `mail_parser` decodes RFC 2047 headers and extracts the first plain-text body part into a `{id, from, subject, date, body}` record.
-3. **Classify** — one request to `POST /api/alpha/decisions` with the mail as `state` and three typed questions.
-4. **Dispatch** — the winning queue is validated against the registry; the record is appended to that queue's JSONL file, or to `_review` when anything is off.
+1. **Ingest** — `ImapListener` logs in, selects the folder read-only, records the highest existing UID, and waits on `IDLE`. On wake it fetches every UID above the cursor, parses the raw message, and hands it to the asyncio consumer through `loop.call_soon_threadsafe`.
+2. **Normalize** — `mail_parser` decodes RFC 2047 headers and extracts the first non-attachment `text/plain` part into a normalized mail record.
+3. **Classify** — `classify()` posts the message as the Decisions API `state` together with three typed questions.
+4. **Dispatch** — `interpret()` applies the thresholds, and `enqueue()` appends the record to the winning queue or to `_review`.
 
-### Why a decision model?
+The blocking HTTP call runs in a worker thread via `asyncio.to_thread`, so the event loop keeps draining the listener queue.
 
-The model returns **typed answers with probabilities**, not prose. There is no prompt engineering, no parsing of free text, and no way to get a plausible-sounding answer with no confidence attached. A `choice` answer carries the full distribution, so the router can enforce a threshold instead of trusting a single label.
+## The three questions
 
-| Question | Type | What it decides |
+| Key | Type | What it decides |
 |---|---|---|
-| `is_zeiss_inquiry` | `noul` | Is this a genuine inquiry, or an automated notification, newsletter, or spam? |
-| `department` | `choice` | Which of the ten ZEISS India queues should own it? |
-| `urgency` | `score` | Routine → time-sensitive → urgent |
+| `is_zeiss_inquiry` | `noul` | Probability that the message is a genuine inquiry (customer, prospect, partner, supplier, regulator, or employee asking for information, support, a quotation, an order, or action) rather than an automated notification, newsletter, marketing blast, spam, or unrelated personal mail. |
+| `department` | `choice` | Which of the ten ZEISS India queue slugs should own the message. |
+| `urgency` | `score` | Ordered levels: routine, time-sensitive, urgent. Returned as a numeric score. |
 
-Default model: [`parallel/decisions-fast:free`](https://openrouter.ai/parallel/decisions-fast:free).
+The model returns typed answers with probabilities rather than free text. That lets the router enforce explicit thresholds instead of trusting a single label, and the full `department` distribution is stored so thresholds can be re-tuned later without re-classifying.
 
----
+The model is only one of three layers. The policy in `interpret()` decides whether to trust the answer, and the action in `enqueue()` is limited to writing a department queue record or a review record. The model never sends, forwards, or moves mail. [`PITCH.md`](PITCH.md) describes the broader model + policy + action pattern and its reuse outside email.
+
+Default model: `parallel/decisions-fast:free`, configurable with `ROUTER_MODEL`.
 
 ## Queues
 
-| Slug | Email address | Purpose |
+These are the internal routing targets behind the unified inbox. In the unified-channel model, customers no longer need to know these addresses; RouteGrid maps each message to one of them, and the `address` is carried in the queue record as metadata for downstream processing.
+
+| Slug | Address | Purpose |
 |---|---|---|
-| `info_in` | info.in@zeiss.com | General ZEISS India inquiries and customer assistance |
-| `mikroservice_india` | mikroservice.india@zeiss.com | Microscopy technical support, servicing, repairs and maintenance |
-| `info_microscopy_in` | info.microscopy.in@zeiss.com | Microscopy product, sales and application inquiries |
-| `info_meditec_in` | info.meditec.in@zeiss.com | Medical technology, ophthalmology and surgical equipment |
-| `iolorder_in` | iolorder.in@zeiss.com | Intraocular lens orders and medical consumables |
-| `info_metrology_in` | info.metrology.in@zeiss.com | Industrial metrology, measurement, inspection and calibration |
-| `zeiss_co_in` | info@zeiss.co.in | Optical products, vision care and consumer optics |
-| `dpo_in` | dpo.in@zeiss.com | Data privacy, GDPR / DPDP requests and personal data |
-| `legal_in` | legal.in@zeiss.com | Legal, compliance, contracts and litigation |
-| `webmaster` | webmaster@zeiss.com | Website problems, broken links and login failures |
-| `_review` | *(local)* | Not an inquiry, low confidence, unknown queue, or error |
+| `info_in` | info.in@zeiss.com | General ZEISS India inquiries, company information, customer assistance, and mail that does not clearly belong to a specialist queue. |
+| `mikroservice_india` | mikroservice.india@zeiss.com | Microscopy technical support, equipment servicing, repairs, maintenance visits, and service contracts. |
+| `info_microscopy_in` | info.microscopy.in@zeiss.com | Microscopy product inquiries, sales information, application assistance, quotations, and demo requests. |
+| `info_meditec_in` | info.meditec.in@zeiss.com | Medical technology inquiries, ophthalmology and surgical equipment, clinical applications, and Meditec sales. |
+| `iolorder_in` | iolorder.in@zeiss.com | Intraocular lens (IOL) orders, medical consumables, order status, delivery, and related order inquiries. |
+| `info_metrology_in` | info.metrology.in@zeiss.com | Industrial metrology, measuring equipment, quality inspection, calibration, and related support. |
+| `zeiss_co_in` | info@zeiss.co.in | Optical products and services, vision care, eyeglass lenses, and consumer optics. |
+| `dpo_in` | dpo.in@zeiss.com | Data privacy concerns, personal data access or deletion requests, and GDPR or Indian privacy compliance. |
+| `legal_in` | legal.in@zeiss.com | Legal inquiries, compliance matters, contracts, litigation, and privacy-related legal concerns. |
+| `webmaster` | webmaster@zeiss.com | Website technical problems, broken links, login failures, and other website issues. |
+| `_review` | *(local only)* | Not an inquiry, low confidence, unknown queue, or classification error. |
 
-The registry lives in [`src/routing/queues.py`](src/routing/queues.py). Adding a queue is a one-entry change: give it a slug, an address, and a description that helps the model tell it apart from the others.
+The registry lives in `src/routing/queues.py`. Adding a department is a one-entry change: give it a slug, an address, and a purpose that helps the model distinguish it from the others. `_review` is not part of the registry; it is the local fallback defined by `REVIEW_QUEUE`.
 
----
+## Routing rules
 
-## Project layout
+| Condition | Destination | Recorded reason |
+|---|---|---|
+| `P(inquiry) < ROUTER_INQUIRY_THRESHOLD` | `_review` | `not a ZEISS inquiry (p=... < ...)` |
+| Chosen slug is not in the queue registry | `_review` | `model chose unknown queue '...'` |
+| `P(queue) < ROUTER_THRESHOLD` | `_review` | `low confidence for <slug> (p=... < ...)` |
+| Per-queue probability missing, answer-level `confidence` present | Threshold checked against that confidence | `low confidence ...` if below; otherwise routes |
+| No per-queue probability and no answer-level confidence | Department queue | `unscored by model` |
+| Any exception during classification | `_review` | `classification_failed: <error>` with `method: "error"` |
 
-```text
-main.py                      Entry point: listener thread + async consumer
-src/
-  config.py                  Environment and .env settings
-  models.py                  Decisions API request/response models
-  decisions.py               HTTP client for /api/alpha/decisions
-  ingestion/
-    mail_parser.py           MIME → normalized mail record
-    imap_listener.py         IMAP IDLE listener (runs in a thread)
-  routing/
-    decision.py              RoutingDecision + log formatting
-    queues.py                Queue registry + JSONL writer
-    router.py                Questions, classification, dispatch, CLI
-queues/                      Per-queue JSONL output (git-ignored)
-DEVLOG.md                    Build log and debugging notes
-requirement.txt              Python dependencies
-```
+Defaults are `ROUTER_INQUIRY_THRESHOLD=0.50` and `ROUTER_THRESHOLD=0.60`.
 
----
+The two missing-probability cases are intentional. Missing metadata is not evidence of a bad classification, so the message still routes rather than being buried. Every other uncertainty lands in `_review` with the reason attached.
 
-## Quick start
+`route()` never raises on classification failure; it writes a review record instead. It can still raise if the queue file itself cannot be written (for example, a permissions error).
 
-**Requirements:** Python 3.10+, a mailbox that supports IMAP with app passwords, and an OpenRouter API key.
+## Setup
+
+**Requirements:** Python 3.10+, an IMAP mailbox that allows app passwords, and an OpenRouter API key.
 
 ```bash
-git clone <repository-url>
-cd RouteGrid
-
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirement.txt
 ```
 
-Create a `.env` file in the project root:
+Dependencies are only `python-dotenv`, `requests`, and `IMAPClient`.
+
+Create a `.env` file in the project root. `src/config.py` loads it from the repository root regardless of the current working directory:
 
 ```ini
 # Mailbox
@@ -153,19 +150,46 @@ API_KEY=sk-or-v1-...
 # Routing (optional)
 ROUTER_MODEL=parallel/decisions-fast:free
 ROUTER_THRESHOLD=0.60
+ROUTER_INQUIRY_THRESHOLD=0.50
 ```
 
-> Gmail requires 2-Step Verification and an [App Password](https://myaccount.google.com/apppasswords). A normal account password will not work.
+`EMAIL_ACCOUNT`, `APP_PASSWORD`, and an OpenRouter key (`API_KEY` or `OPENROUTER_API_KEY`) are required. Gmail needs 2-Step Verification and an [App Password](https://myaccount.google.com/apppasswords); a normal account password will not work.
 
-Start the listener:
+## Configuration
+
+All settings are read from the environment, with `.env` loaded once at import time. Restart the process after changing them.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IMAP_SERVER` | `imap.mail.yahoo.com` | IMAP host. |
+| `IMAP_PORT` | `993` | IMAP SSL port. |
+| `EMAIL_ACCOUNT` | — | Mailbox login. **Required.** |
+| `APP_PASSWORD` | — | Mailbox app password. **Required.** |
+| `IMAP_FOLDER` | `INBOX` | Folder to watch. |
+| `IDLE_TIMEOUT` | `60` | Seconds per IDLE wait before re-checking. |
+| `RECONNECT_DELAY` | `5` | Seconds to wait before reconnecting after an IMAP error. |
+| `API_KEY` | — | OpenRouter key. `OPENROUTER_API_KEY` is used as a fallback. **Required.** |
+| `ROUTER_MODEL` | `parallel/decisions-fast:free` | Decisions model ID. |
+| `REQUEST_TIMEOUT` | `60` | HTTP timeout in seconds. |
+| `RETRY_ATTEMPTS` | `3` | Total attempts for retryable HTTP responses. |
+| `MAX_BODY_CHARS` | `8000` | Body characters sent to the model. |
+| `ROUTER_THRESHOLD` | `0.60` | Minimum queue probability before routing. |
+| `ROUTER_INQUIRY_THRESHOLD` | `0.50` | Minimum probability that the mail is a real inquiry. |
+| `QUEUE_DIR` | `<repository>/queues` | Where queue files are written. A relative value is resolved against the current working directory. |
+
+The endpoint is fixed at `https://openrouter.ai/api/alpha/decisions`.
+
+## Running the listener
 
 ```bash
 python main.py
 ```
 
+Typical output:
+
 ```text
 RouteGrid listening on imap.gmail.com:993 [INBOX]
-Queue directory: /path/to/RouteGrid/queues
+Queue directory: /path/to/ZEISS/queues
 Connecting to imap.gmail.com:993...
 Watching INBOX for new mail (UID > 12470)...
 
@@ -176,130 +200,29 @@ Subject: Purchase order for IOL lenses
 Date: Wed, 11 Nov 2026 09:13:40 +0530
 Body: Dear ZEISS India, we would like to order 40 intraocular lenses...
 -------------------------------
-Routed to: iolorder_in (iolorder.in@zeiss.com) confidence=1.00 urgency=0.25
+Routed to: iolorder_in (iolorder.in@zeiss.com) confidence=0.99 urgency=0.31
 ===============================
 ```
 
-Stop with `Ctrl+C`. Only mail that arrives **after** startup is processed; the existing inbox is left untouched.
+Stop with `Ctrl+C`. Only mail arriving **after** startup is processed; the existing inbox is left untouched.
 
----
+## Project layout
 
-## Configuration
-
-All settings are read from the environment, with `.env` loaded from the project root.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `IMAP_SERVER` | `imap.mail.yahoo.com` | IMAP host |
-| `IMAP_PORT` | `993` | IMAP SSL port |
-| `EMAIL_ACCOUNT` | — | Mailbox login **(required)** |
-| `APP_PASSWORD` | — | Mailbox app password **(required)** |
-| `IMAP_FOLDER` | `INBOX` | Folder to watch |
-| `IDLE_TIMEOUT` | `60` | Seconds per IDLE wait before re-checking |
-| `RECONNECT_DELAY` | `5` | Seconds to wait before reconnecting |
-| `API_KEY` | — | OpenRouter key; `OPENROUTER_API_KEY` also works **(required)** |
-| `ROUTER_MODEL` | `parallel/decisions-fast:free` | Decisions model ID |
-| `ROUTER_THRESHOLD` | `0.60` | Minimum queue probability before routing |
-| `ROUTER_INQUIRY_THRESHOLD` | `0.50` | Minimum probability that the mail is a real inquiry |
-| `REQUEST_TIMEOUT` | `60` | HTTP timeout in seconds |
-| `RETRY_ATTEMPTS` | `3` | Attempts for `429` / `5xx` responses |
-| `MAX_BODY_CHARS` | `8000` | Body characters sent to the model |
-| `QUEUE_DIR` | `./queues` | Where queue files are written |
-
----
-
-## Classify a single message
-
-The router has a small CLI that runs the same pipeline without the listener. `--dry-run` classifies and prints the full probability distribution without writing a queue file.
-
-```bash
-python -m src.routing.router --list-queues
-python -m src.routing.router sample.json --dry-run
-python -m src.routing.router sample.json
-python -m src.routing.router mail.eml
-python -m src.routing.router --subject "IOL order" --body "Please send 40 lenses."
-```
-
-Accepted inputs: a JSON mail record, a raw `.eml` file, or a plain-text file. Explicit `--subject` / `--sender` / `--body` flags override values read from the file.
-
----
-
-## Queue output
-
-Each routed message is appended as one JSON line to `queues/<queue>/<YYYY-MM-DD>.jsonl`:
-
-```json
-{
-  "queued_at": "2026-11-11T09:14:02+00:00",
-  "queue": "iolorder_in",
-  "address": "iolorder.in@zeiss.com",
-  "decision": {
-    "confidence": 0.99,
-    "probabilities": { "iolorder_in": 0.99, "info_in": 0.01 },
-    "urgency": 0.31,
-    "is_zeiss_inquiry": 1.0,
-    "method": "decisions",
-    "reason": "",
-    "model": "parallel/decisions-fast-20261106",
-    "cost_usd": 0.0
-  },
-  "mail": {
-    "id": "12471",
-    "from": "Dr Rao <dr.rao@eyehospital.in>",
-    "subject": "Purchase order for IOL lenses",
-    "date": "Wed, 11 Nov 2026 09:13:40 +0530",
-    "body": "Dear ZEISS India, we would like to order 40 intraocular lenses..."
-  }
-}
-```
-
-`probabilities` contains the model's full distribution over the ten queues, so thresholds can be re-tuned later without re-classifying. `model` is the exact build that answered.
-
-A downstream worker can tail these files, load them into a CRM, or feed a ticketing system. RouteGrid does not consume its own output.
-
----
-
-## Routing policy
-
-| Condition | Destination |
-|---|---|
-| Genuine inquiry and `P(queue) ≥ ROUTER_THRESHOLD` | That department queue |
-| `P(inquiry) < ROUTER_INQUIRY_THRESHOLD` | `_review` — `not a ZEISS inquiry` |
-| Best queue probability below the threshold | `_review` — `low confidence` |
-| Model returns an unknown queue slug | `_review` — `unknown queue` |
-| API error, timeout, or invalid response | `_review` — `classification_failed` |
-| Model omits probabilities | Routes anyway, marked `unscored by model` |
-
-The last case is deliberate: missing metadata is not evidence of a bad classification, so the message is routed rather than buried. Every other uncertainty lands in `_review` with the reason recorded.
-
----
-
-## Operational notes
-
-- **Backlog is skipped.** On connect, `last_uid` starts at the highest UID in the folder. Mail that arrived while the process was down is not replayed; rerun the CLI over an `.eml` export if you need to backfill.
-- **Reconnects automatically.** Any IMAP exception is logged, then retried after `RECONNECT_DELAY`. A changed `UIDVALIDITY` resets the cursor to the new mailbox state.
-- **Read-only.** The folder is selected with `readonly=True`; RouteGrid never sets `\Seen`, moves, or deletes messages.
-- **Retries are narrow.** `429` and `5xx` responses are retried with exponential backoff. `400`, `401`, and `402` fail immediately with a hint in the log.
-- **One API call per mail.** Classification is a single request; urgency rides along at no extra cost.
-- **Costs are recorded.** Each queue record carries the `cost_usd` reported by the API.
-
----
-
-## Security
-
-- `.env` is git-ignored. Keep it that way.
-- Use a dedicated app password for the mailbox, not your account password, and revoke it if the repo is shared.
-- Rotate the OpenRouter key if it has ever been committed. Deleting the file in a later commit does not remove it from history; purge the history or rotate the credential.
-- Queue files contain full message bodies and personal data. They are git-ignored for that reason; treat them with the same care as the mailbox itself.
-
----
-
-## Development
-
-- [`DEVLOG.md`](DEVLOG.md) records the build in stages: IMAP ingestion, decisions-based routing, then the listener/package restructure, including the obstacles hit along the way.
-- The classification logic is pure and injectable: `interpret()` takes validated answers and returns a `RoutingDecision`, so threshold behaviour can be checked without network access.
-- `route()` never raises on classification failure; it records the error in `_review`. That is the contract the consumer relies on.
-
-```bash
-python -m py_compile main.py src/*.py src/ingestion/*.py src/routing/*.py
+```text
+main.py                      Entry point: IMAP listener thread + async consumer
+PITCH.md                     Pitch: model + policy + action, and reuse beyond email
+requirement.txt              Python dependencies
+DEVLOG.md                    Historical build log (may name removed files)
+src/
+  config.py                  Environment and .env settings, loaded at import
+  models.py                  Decisions API question/answer/payload models
+  decisions.py               The only module that performs HTTP
+  ingestion/
+    imap_listener.py         IMAP IDLE listener, runs in a daemon thread
+    mail_parser.py           MIME bytes -> normalized mail record
+  routing/
+    decision.py              RoutingDecision and log formatting
+    queues.py                Queue registry and JSONL writer
+    router.py                Questions, classification, dispatch, CLI
+queues/                      Runtime output: <slug>/<YYYY-MM-DD>.jsonl
 ```
