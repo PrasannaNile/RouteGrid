@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 PITCH.md
 AGENTS.md
-
+Mid progress
 # C extensions (if compiling C/C++ extensions later)
 *.so
 
