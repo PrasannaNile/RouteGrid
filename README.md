@@ -1,6 +1,21 @@
-# RouteGrid
+<p align="center">
+  <img src="https://i.postimg.cc/wv5nsJ0h/Route-Grid.png" alt="RouteGrid logo" width="360">
+</p>
 
-**Prototype email triage for ZEISS India.** RouteGrid is the routing layer for a proposed unified customer email channel: customers write to one address, `contact@zeiss.com`, and RouteGrid decides which department queue should own each message. It watches an IMAP inbox, asks an OpenRouter Decisions model three typed questions, and appends the message to a local JSONL queue for downstream processing. It does not send replies, forward mail, or change anything in the mailbox.
+<h1 align="center">RouteGrid</h1>
+
+<p align="center">
+  <strong>Reflexive email triage for ZEISS India</strong><br>
+  Watches an inbox, understands each message, and files it in the right department queue in a single API call.
+</p>
+
+<p align="center">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="OpenRouter Decisions" src="https://img.shields.io/badge/OpenRouter-Decisions-6467f2">
+  <img alt="IMAP IDLE" src="https://img.shields.io/badge/IMAP-IDLE-0b7285">
+</p>
+
+RouteGrid is the routing layer for a proposed unified customer email channel: customers write to one address, `contact@zeiss.com`, and RouteGrid decides which department queue should own each message. It watches an IMAP inbox, asks an OpenRouter Decisions model three typed questions, and appends the message to a local JSONL queue for downstream processing. It does not send replies, forward mail, or change anything in the mailbox.
 
 > **Status:** prototype. Output is local JSONL under `queues/`. There is no database, ticketing integration, or downstream consumer in this repository. For the rationale and the broader understand please provided Document.
 
