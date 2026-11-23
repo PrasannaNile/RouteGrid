@@ -17,7 +17,7 @@
 
 RouteGrid is the routing layer for a proposed unified customer email channel: customers write to one address, `contact@zeiss.com`, and RouteGrid decides which department queue should own each message. It watches an IMAP inbox, asks an OpenRouter Decisions model three typed questions, and appends the message to a local JSONL queue for downstream processing. It does not send replies, forward mail, or change anything in the mailbox.
 
-> **Status:** prototype. Output is local JSONL under `queues/`. There is no database, ticketing integration, or downstream consumer in this repository. For the rationale and the broader understand please provided Document.
+> **Status:** prototype. Output is local JSONL under `queues/`. There is no database, ticketing integration, or downstream consumer in this repository. For the rationale and the broader understand please read provided Document.
 
 ## What it does
 
